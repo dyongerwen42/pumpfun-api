@@ -109,6 +109,8 @@ pub enum PumpFunEvent {
     Trade(TradeEvent),
     Complete(CompleteEvent),
     SetParams(SetParamsEvent),
+    Unhandled(String, Vec<u8>), // For unhandled events
+    Unknown(String, Vec<u8>),   // For unknown events
 }
 
 /// Represents an active WebSocket subscription to Pump.fun events
@@ -147,7 +149,10 @@ impl Drop for Subscription {
 /// # Returns
 ///
 /// Returns a parsed PumpFunEvent if successful, or an error if parsing fails
-pub fn parse_event(signature: &str, data: &str) -> Result<PumpFunEvent, Box<dyn Error>> {
+pub fn parse_event(
+    signature: &str,
+    data: &str,
+) -> Result<PumpFunEvent, Box<dyn Error + Send + Sync>> {
     // Decode base64
     let decoded = base64::engine::general_purpose::STANDARD.decode(data)?;
 
@@ -178,7 +183,24 @@ pub fn parse_event(signature: &str, data: &str) -> Result<PumpFunEvent, Box<dyn 
             SetParamsEvent::try_from_slice(&decoded[8..])
                 .map_err(|e| format!("Failed to decode SetParamsEvent: {}", e))?,
         )),
-        _ => Err(format!("Unknown event: signature={} data={}", signature, data).into()),
+        // Other unhandled Pump.fun events
+        [64, 69, 192, 104, 29, 30, 25, 107]
+        | [245, 59, 70, 34, 75, 185, 109, 92]
+        | [147, 250, 108, 120, 247, 29, 67, 222]
+        | [79, 172, 246, 49, 205, 91, 206, 232]
+        | [146, 159, 189, 172, 146, 88, 56, 244]
+        | [122, 2, 127, 1, 14, 191, 12, 175]
+        | [189, 233, 93, 185, 92, 148, 234, 148]
+        | [97, 97, 215, 144, 93, 146, 22, 124]
+        | [134, 36, 13, 72, 232, 101, 130, 216]
+        | [237, 52, 123, 37, 245, 251, 72, 210]
+        | [142, 203, 6, 32, 127, 105, 191, 162]
+        | [197, 122, 167, 124, 116, 81, 91, 255]
+        | [182, 195, 137, 42, 35, 206, 207, 247] => {
+            Ok(PumpFunEvent::Unhandled(signature.to_string(), decoded))
+        }
+        // Unknown event type
+        _ => Ok(PumpFunEvent::Unknown(signature.to_string(), decoded)),
     }
 }
 
@@ -194,6 +216,7 @@ pub fn parse_event(signature: &str, data: &str) -> Result<PumpFunEvent, Box<dyn 
 /// # Arguments
 ///
 /// * `cluster` - Solana cluster configuration containing RPC endpoints
+/// * `mentioned` - Optional public key to filter events by mentions. If None, subscribes to all Pump.fun events
 /// * `commitment` - Optional commitment level for the subscription. If None, uses the
 ///   default from the cluster configuration
 /// * `callback` - A function that will be called for each event with the following parameters:
@@ -248,12 +271,17 @@ pub fn parse_event(signature: &str, data: &str) -> Result<PumpFunEvent, Box<dyn 
 /// ```
 pub async fn subscribe<F>(
     cluster: Cluster,
+    mentioned: Option<String>,
     commitment: Option<CommitmentConfig>,
     callback: F,
 ) -> Result<Subscription, error::ClientError>
 where
-    F: Fn(String, Option<PumpFunEvent>, Option<Box<dyn Error>>, Response<RpcLogsResponse>)
-        + Send
+    F: Fn(
+            String,
+            Option<PumpFunEvent>,
+            Option<Box<dyn Error + Send + Sync>>,
+            Response<RpcLogsResponse>,
+        ) + Send
         + Sync
         + 'static,
 {
@@ -264,12 +292,21 @@ where
         .map_err(error::ClientError::PubsubClientError)?;
 
     let (tx, _) = mpsc::channel(1);
+    let (cb_tx, mut cb_rx) = mpsc::channel(1000);
+
+    tokio::spawn(async move {
+        while let Some((sig, event, err, log)) = cb_rx.recv().await {
+            callback(sig, event, err, log);
+        }
+    });
 
     let task = tokio::spawn(async move {
         // Subscribe to logs for the program
         let (mut stream, _unsubscribe) = pubsub_client
             .logs_subscribe(
-                RpcTransactionLogsFilter::Mentions(vec![constants::accounts::PUMPFUN.to_string()]),
+                RpcTransactionLogsFilter::Mentions(vec![
+                    mentioned.unwrap_or(constants::accounts::PUMPFUN.to_string())
+                ]),
                 RpcTransactionLogsConfig {
                     commitment: Some(commitment.unwrap_or(cluster.commitment)),
                 },
@@ -280,15 +317,22 @@ where
         // Process incoming logs
         while let Some(log) = stream.next().await {
             // Get the signature of the transaction
-            let signature = log.value.signature.clone();
+            let signature = &log.value.signature;
             // Check for logs with "Program data:" prefix
-            for log_line in log.value.logs.clone() {
-                if log_line.starts_with("Program data:") {
-                    // Extract base64-encoded data
-                    let data = log_line.replace("Program data: ", "").trim().to_string();
-                    match parse_event(&signature, &data) {
-                        Ok(event) => callback(signature.clone(), Some(event), None, log.clone()),
-                        Err(err) => callback(signature.clone(), None, Some(err), log.clone()),
+            for log_line in &log.value.logs {
+                // Extract base64-encoded data
+                if let Some(data) = log_line.strip_prefix("Program data: ") {
+                    match parse_event(signature, data) {
+                        Ok(event) => {
+                            let _ = cb_tx
+                                .send((signature.to_string(), Some(event), None, log.clone()))
+                                .await;
+                        }
+                        Err(err) => {
+                            let _ = cb_tx
+                                .send((signature.to_string(), None, Some(err), log.clone()))
+                                .await;
+                        }
                     }
                 }
             }
@@ -330,7 +374,7 @@ mod tests {
             let events = Arc::clone(&events);
             move |signature: String,
                   event: Option<PumpFunEvent>,
-                  err: Option<Box<dyn Error>>,
+                  err: Option<Box<dyn Error + Send + Sync>>,
                   _: Response<RpcLogsResponse>| {
                 if let Some(event) = event {
                     let events = Arc::clone(&events);
@@ -345,7 +389,7 @@ mod tests {
         };
 
         // Start the subscription
-        let subscription = subscribe(cluster, None, callback)
+        let subscription = subscribe(cluster, None, None, callback)
             .await
             .expect("Failed to start subscription");
 

@@ -512,6 +512,7 @@ impl PumpFun {
     ///
     /// # Arguments
     ///
+    /// * `mentioned` - Optional public key to filter events by mentions. If None, subscribes to all Pump.fun events
     /// * `commitment` - Optional commitment level for the subscription. If None, uses the
     ///   default from the cluster configuration
     /// * `callback` - A function that will be called for each event with the following parameters:
@@ -579,6 +580,7 @@ impl PumpFun {
     #[cfg(feature = "stream")]
     pub async fn subscribe<F>(
         &self,
+        mentioned: Option<String>,
         commitment: Option<solana_sdk::commitment_config::CommitmentConfig>,
         callback: F,
     ) -> Result<common::stream::Subscription, error::ClientError>
@@ -586,13 +588,13 @@ impl PumpFun {
         F: Fn(
                 String,
                 Option<common::stream::PumpFunEvent>,
-                Option<Box<dyn std::error::Error>>,
+                Option<Box<dyn std::error::Error + Send + Sync>>,
                 solana_client::rpc_response::Response<solana_client::rpc_response::RpcLogsResponse>,
             ) + Send
             + Sync
             + 'static,
     {
-        common::stream::subscribe(self.cluster.clone(), commitment, callback).await
+        common::stream::subscribe(self.cluster.clone(), mentioned, commitment, callback).await
     }
 
     /// Creates compute budget instructions for priority fees
@@ -755,17 +757,14 @@ impl PumpFun {
     ) -> Result<Vec<Instruction>, error::ClientError> {
         // Get accounts and calculate buy amounts
         let global_account = self.get_global_account().await?;
-        let mut bonding_curve_account: Option<accounts::BondingCurveAccount> = None;
         let buy_amount = {
             let bonding_curve_pda = Self::get_bonding_curve_pda(&mint)
                 .ok_or(error::ClientError::BondingCurveNotFound)?;
             if self.rpc.get_account(&bonding_curve_pda).await.is_err() {
                 global_account.get_initial_buy_price(amount_sol)
             } else {
-                bonding_curve_account = self.get_bonding_curve_account(&mint).await.ok();
+                let bonding_curve_account = self.get_bonding_curve_account(&mint).await?;
                 bonding_curve_account
-                    .as_ref()
-                    .unwrap()
                     .get_buy_price(amount_sol)
                     .map_err(error::ClientError::BondingCurveError)?
             }
@@ -794,7 +793,7 @@ impl PumpFun {
             &self.payer,
             &mint,
             &global_account.fee_recipient,
-            &bonding_curve_account.map_or(self.payer.pubkey(), |bc| bc.creator),
+            &self.payer.pubkey(),
             instructions::Buy {
                 amount: buy_amount,
                 max_sol_cost: buy_amount_with_slippage,
