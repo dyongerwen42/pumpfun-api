@@ -18,13 +18,11 @@ pub struct Subscription {
     pub task: JoinHandle<()>,
     pub unsubscribe: Box<dyn Fn() + Send>,
 }
-
 impl Subscription {
     pub fn new(task: JoinHandle<()>, unsubscribe: Box<dyn Fn() + Send>) -> Self {
         Subscription { task, unsubscribe }
     }
 }
-
 impl Drop for Subscription {
     fn drop(&mut self) {
         (self.unsubscribe)();
@@ -184,10 +182,9 @@ where
     });
 
     let task = tokio::spawn(async move {
-        // luister alles; filter op BONK via pre/postTokenBalances
         let (mut stream, _unsubscribe) = pubsub_client
             .logs_subscribe(
-                RpcTransactionLogsFilter::All,
+                RpcTransactionLogsFilter::All, // luister alles; filteren doen we met balances
                 RpcTransactionLogsConfig {
                     commitment: Some(commitment.unwrap_or(cluster.commitment)),
                 },
@@ -212,7 +209,7 @@ where
                 }
                 Err(e) => {
                     let _ = cb_tx
-                        .send((signature.clone(), None, Some(Box::<dyn Error + Send + Sync>::from(e.to_string())), log.clone()))
+                        .send((signature.clone(), None, Some(Box::new(e)), log.clone()))
                         .await;
                 }
             }
@@ -225,4 +222,29 @@ where
             let _ = tx.try_send(());
         }),
     ))
+}
+
+/* ---- Compat-laag voor bestaande aanroepen in lib.rs (NIETS elders aanpassen) ---- */
+pub type PumpFunEvent = BonkEvent;
+
+pub async fn subscribe<F>(
+    cluster: Cluster,
+    _mentioned: Option<String>,
+    commitment: Option<CommitmentConfig>,
+    callback: F,
+) -> Result<Subscription, error::ClientError>
+where
+    F: Fn(
+            String,
+            Option<PumpFunEvent>,
+            Option<Box<dyn Error + Send + Sync>>,
+            Response<RpcLogsResponse>,
+        ) + Send
+        + Sync
+        + 'static,
+{
+    // route naar BONK-only stream; API blijft hetzelfde voor lib.rs
+    subscribe_bonk(cluster, commitment, move |sig, evt, err, raw| {
+        callback(sig, evt, err, raw);
+    }).await
 }
