@@ -255,9 +255,9 @@ pub fn parse_event(
 ///     // Define callback to process events
 ///     let callback = |signature, event, error, _| {
 ///         if let Some(event) = event {
-///             println!("Event received: {:#?} in tx: {}", event, signature);
+///             println!(\"Event received: {:#?} in tx: {}\", event, signature);
 ///         } else if let Some(err) = error {
-///             eprintln!("Error parsing event in tx {}: {}", signature, err);
+///             eprintln!(\"Error parsing event in tx {}: {}\", signature, err);
 ///         }
 ///     };
 ///
@@ -347,6 +347,105 @@ where
     ))
 }
 
+/* -------------------------------------------------------------------------
+   BONK STREAM (geen nieuwe imports, geen hernoemingen)
+   - Zelfde callback signature als subscribe(...)
+   - Filtert op BONK mint als je geen 'mentioned' meegeeft
+   - Roept de callback óók aan als er géén `Program data:` regels zijn,
+     zodat je toch een stream krijgt op basis van de raw logs.
+---------------------------------------------------------------------------*/
+
+/// BONK mint (mainnet)
+const __BONK_MINT: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+
+/// Zoals `subscribe`, maar default filtert op BONK mint.
+/// Je krijgt bij iedere tx die BONK **mentiont** ten minste één callback:
+/// - Als er `Program data:` regels zijn die je kunt parsen met `parse_event`, sturen we `Some(PumpFunEvent)`.
+/// - Als er géén parsebare data is, sturen we `event=None`, `error=None` en kun je de raw logs (4e arg) gebruiken.
+pub async fn subscribe_bonk<F>(
+    cluster: Cluster,
+    mentioned: Option<String>,
+    commitment: Option<CommitmentConfig>,
+    callback: F,
+) -> Result<Subscription, error::ClientError>
+where
+    F: Fn(
+            String,
+            Option<PumpFunEvent>,
+            Option<Box<dyn Error + Send + Sync>>,
+            Response<RpcLogsResponse>,
+        ) + Send
+        + Sync
+        + 'static,
+{
+    let ws_url = &cluster.rpc.ws;
+    let pubsub_client = PubsubClient::new(ws_url)
+        .await
+        .map_err(error::ClientError::PubsubClientError)?;
+
+    let (tx, _) = mpsc::channel(1);
+    let (cb_tx, mut cb_rx) = mpsc::channel(1000);
+
+    tokio::spawn(async move {
+        while let Some((sig, event, err, log)) = cb_rx.recv().await {
+            callback(sig, event, err, log);
+        }
+    });
+
+    let task = tokio::spawn(async move {
+        let bonk_or_custom = mentioned.unwrap_or(__BONK_MINT.to_string());
+
+        let (mut stream, _unsubscribe) = pubsub_client
+            .logs_subscribe(
+                solana_client::rpc_config::RpcTransactionLogsFilter::Mentions(vec![bonk_or_custom]),
+                solana_client::rpc_config::RpcTransactionLogsConfig {
+                    commitment: Some(commitment.unwrap_or(cluster.commitment)),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Voor elke tx die de BONK mint (of custom 'mentioned') aanraakt:
+        while let Some(log) = stream.next().await {
+            let signature = &log.value.signature;
+
+            // 1) Eerst proberen we eventuele `Program data:` regels te parsen zoals bij Pump.fun
+            let mut any_sent = false;
+            for log_line in &log.value.logs {
+                if let Some(data) = log_line.strip_prefix("Program data: ") {
+                    any_sent = true;
+                    match parse_event(signature, data) {
+                        Ok(event) => {
+                            let _ = cb_tx
+                                .send((signature.to_string(), Some(event), None, log.clone()))
+                                .await;
+                        }
+                        Err(err) => {
+                            let _ = cb_tx
+                                .send((signature.to_string(), None, Some(err), log.clone()))
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            // 2) Als er geen parsebare data was: toch één callback geven met raw logs
+            if !any_sent {
+                let _ = cb_tx
+                    .send((signature.to_string(), None, None, log.clone()))
+                    .await;
+            }
+        }
+    });
+
+    Ok(Subscription::new(
+        task,
+        Box::new(move || {
+            let _ = tx.try_send(());
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::types::PriorityFee;
@@ -388,7 +487,7 @@ mod tests {
             }
         };
 
-        // Start the subscription
+        // Start the subscription (Pump.fun default)
         let subscription = subscribe(cluster, None, None, callback)
             .await
             .expect("Failed to start subscription");
